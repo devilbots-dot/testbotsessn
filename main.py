@@ -98,12 +98,12 @@ def log_otp(session_name: str, line: str):
 
 # ---------------- Bot commands / callbacks ----------------
 @app.on_message(filters.private & filters.command("start"))
-@filters.me  # not necessary but keep; we'll check owner below
 async def start_cmd(c, m):
     if m.from_user.id != OWNER_ID:
         await m.reply_text("Access denied.")
         return
     await m.reply_text("Welcome — choose an action:", reply_markup=HOME_KB)
+
 
 @app.on_callback_query()
 async def cb_handler(c, cb):
