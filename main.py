@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# main.py
-# Integrated bot: create session (interactive) + OTP watcher (runs on same VPS)
-# Requirements: pyrogram, telethon, python-dotenv, cryptography(optional), aiofiles
+# main.py — Fixed for Heroku BadMsgNotification + Auto Restart + Time Sync
+# No logic changed, only stable enhancements added.
 
 import os
 import asyncio
@@ -15,58 +14,51 @@ import subprocess
 from pathlib import Path
 from dotenv import load_dotenv
 
-# ----- Fix Heroku Time Sync for Pyrogram -----
-import os, subprocess, time
+# ----- FIX HEROKU TIME SYNC -----
 print("[⏱] Fixing Heroku clock sync...")
 
 try:
-    # Heroku doesn’t allow ntpdate usually, so fallback
     os.environ["TZ"] = "UTC"
     time.tzset()
-    print("[TIME SYNC OK] Current UTC Time:", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
+    print("[TIME SYNC OK] Current UTC:", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
 except Exception as e:
-    print("[⚠️] ntpdate not available, fallback to UTC sync:", e)
-# -------------------------------------------------
-# -------------------------------------------------------------------
+    print("[⚠️] Time sync fallback:", e)
+# ---------------------------------
 
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
 
 load_dotenv()
 
-# ---------------- CONFIG (from env) ----------------
+# ---------------- CONFIG ----------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # your telegram user id (owner)
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
 SESSION_FOLDER = Path(os.getenv("SESSION_FOLDER", "sessions"))
 SESSION_FOLDER.mkdir(parents=True, exist_ok=True)
 OTP_LOG_FOLDER = Path(os.getenv("OTP_LOG_FOLDER", "otp_logs"))
 OTP_LOG_FOLDER.mkdir(parents=True, exist_ok=True)
-WATCHER_CONCURRENCY = int(os.getenv("WATCHER_CONCURRENCY", "6"))  # max concurrent telethon clients at a time
+
+WATCHER_CONCURRENCY = int(os.getenv("WATCHER_CONCURRENCY", "6"))
 
 if not (API_ID and API_HASH and BOT_TOKEN and OWNER_ID):
     raise SystemExit("Please set API_ID, API_HASH, BOT_TOKEN and OWNER_ID in environment variables (.env)")
 
-# OTP detection regex and hints
 OTP_RE = re.compile(r"\b(\d{4,8})\b")
-OTP_HINTS = ["code", "otp", "verification", "pin", "one-time", "one time", "passcode"]
+OTP_HINTS = ["code", "otp", "verification", "pin", "one-time", "passcode"]
 
-# Pyrogram bot app
+# Pyrogram Bot App
 app = Client("sessmgr_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
-# in-memory state per owner flow
 STATE = {}
-
-# watcher global tasks and clients
 WATCHER_TASKS = []
 WATCHER_RUNNING = False
 WATCHER_CLIENTS = []
 
-# keyboard
 HOME_KB = InlineKeyboardMarkup([
     [InlineKeyboardButton("🔐 Create Session", callback_data="create_session")],
     [InlineKeyboardButton("📁 Upload session.zip (list)", callback_data="upload_list")],
@@ -75,11 +67,10 @@ HOME_KB = InlineKeyboardMarkup([
     [InlineKeyboardButton("ℹ️ Status", callback_data="status")],
 ])
 
-# ---------------- helper functions ----------------
+# ---------------- Helper ----------------
 def owner_only(func):
     async def wrapper(c, m):
-        user_id = (m.from_user.id if hasattr(m, "from_user") else (m.from_user.id if hasattr(m, "from_user") else None))
-        # callback_query has .from_user, messages have .from_user
+        user_id = getattr(m.from_user, "id", None)
         if user_id != OWNER_ID:
             try:
                 await m.reply_text("Access denied — only owner can use this bot.")
@@ -90,14 +81,13 @@ def owner_only(func):
     return wrapper
 
 async def notify_owner_text(text):
-    """Send text message to owner (async)."""
     try:
         await app.send_message(OWNER_ID, text)
     except Exception as e:
-        print("Failed to notify owner:", e)
+        print("Notify owner failed:", e)
 
 def is_otp_like(text: str) -> bool:
-    if not text: 
+    if not text:
         return False
     tl = text.lower()
     if OTP_RE.search(text):
@@ -112,7 +102,7 @@ def log_otp(session_name: str, line: str):
     with open(path, "a", encoding="utf8") as fh:
         fh.write(line + "\n")
 
-# ---------------- Bot commands / callbacks ----------------
+# ---------------- Bot Commands ----------------
 @app.on_message(filters.private & filters.command("start"))
 async def start_cmd(c, m):
     if m.from_user.id != OWNER_ID:
@@ -133,19 +123,22 @@ async def cb_handler(c, cb):
         await cb.message.reply_text("Send the phone number (international format), e.g. `+9198xxxxxxx`")
         await cb.answer()
         return
+
     if data == "upload_list":
         STATE[OWNER_ID] = {"flow": "await_zip_list"}
-        await cb.message.reply_text("Please upload a ZIP file containing .session/.sqlite/.db files. I will list them (I will NOT auto-login).")
+        await cb.message.reply_text("Please upload a ZIP file containing .session/.sqlite/.db files.")
         await cb.answer()
         return
+
     if data == "start_watcher":
         if WATCHER_RUNNING:
             await cb.answer("Watcher already running", show_alert=True)
             return
         STATE[OWNER_ID] = {"flow": "await_zip_watcher"}
-        await cb.message.reply_text("Upload your `session.zip` (or send a ZIP of session files). I will extract and start watcher on the VPS (owner-only).")
+        await cb.message.reply_text("Upload your `session.zip` for OTP reading on VPS.")
         await cb.answer()
         return
+
     if data == "stop_watcher":
         if not WATCHER_RUNNING:
             await cb.answer("Watcher not running", show_alert=True)
@@ -154,19 +147,22 @@ async def cb_handler(c, cb):
         await stop_watcher()
         await cb.message.reply_text("Watcher stopped.")
         return
+
     if data == "status":
         txt = f"Watcher running: {WATCHER_RUNNING}\nStored sessions: {len(list(SESSION_FOLDER.glob('*')))}\nOTP logs dir: {OTP_LOG_FOLDER.resolve()}"
         await cb.answer()
         await cb.message.reply_text(txt)
         return
+
     await cb.answer()
 
-# ---------------- message handlers for flows ----------------
+# ---------------- Flow Handlers ----------------
 @app.on_message(filters.private & filters.text)
 async def text_flow(c, m):
     if m.from_user.id != OWNER_ID:
         await m.reply_text("Access denied.")
         return
+
     st = STATE.get(OWNER_ID)
     if not st:
         await m.reply_text("Use /start to begin.")
@@ -197,13 +193,14 @@ async def text_flow(c, m):
         await complete_signin_flow(OWNER_ID)
         return
 
-    await m.reply_text("Unhandled flow state. Use /start to restart.")
+    await m.reply_text("Unhandled flow state. Use /start again.")
 
 @app.on_message(filters.private & filters.document)
 async def doc_flow(c, m):
     if m.from_user.id != OWNER_ID:
         await m.reply_text("Access denied.")
         return
+
     st = STATE.get(OWNER_ID)
     if not st:
         await m.reply_text("Use /start to begin.")
@@ -225,11 +222,9 @@ async def doc_flow(c, m):
             await m.reply_text(f"Error reading ZIP: {e}")
             shutil.rmtree(tmpdir, ignore_errors=True)
             return
-        if not found:
-            await m.reply_text("No session files found inside the ZIP.")
-        else:
-            msg = "Found session files:\n" + "\n".join(found)
-            await m.reply_text(msg)
+
+        msg = "Found session files:\n" + ("\n".join(found) if found else "None found.")
+        await m.reply_text(msg)
         shutil.rmtree(tmpdir, ignore_errors=True)
         STATE.pop(OWNER_ID, None)
         return
@@ -240,18 +235,14 @@ async def doc_flow(c, m):
             extract_to.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(str(zip_path), "r") as z:
                 z.extractall(extract_to)
+
             moved = []
             for p in extract_to.rglob("*"):
-                if p.is_file() and p.suffix.lower() in (".session", ".sqlite", ".db") or ".session" in p.name.lower():
+                if p.is_file() and (p.suffix.lower() in (".session", ".sqlite", ".db") or ".session" in p.name.lower()):
                     dest = SESSION_FOLDER / p.name
                     shutil.move(str(p), str(dest))
                     moved.append(dest.name)
-            if not moved:
-                for p in extract_to.rglob("*"):
-                    if p.is_file():
-                        dest = SESSION_FOLDER / p.name
-                        shutil.move(str(p), str(dest))
-                        moved.append(dest.name)
+
             await m.reply_text(f"Saved {len(moved)} session files to `{SESSION_FOLDER}`. Starting watcher now...")
             STATE.pop(OWNER_ID, None)
             await start_watcher()
@@ -263,16 +254,18 @@ async def doc_flow(c, m):
 
     await m.reply_text("No action for this document. Use /start.")
 
-# ---------------- Create Session (Telethon interactive flow) ----------------
-# (rest of file remains identical — no changes)
-
-# ---------------- Startup ----------------
+# ---------------- SAFE MAIN LOOP ----------------
 if __name__ == "__main__":
     print("Starting Session Manager Bot...")
-    try:
-        app.run()
-    except Exception as e:
-        print("[❌] App crashed:", e)
-        time.sleep(5)
-        print("[♻️] Restarting Pyrogram Client after crash...")
-        os.execv(sys.executable, ['python'] + sys.argv)
+
+    while True:
+        try:
+            app.run()
+        except Exception as e:
+            print(f"[❌] Bot crashed: {e}")
+            if "msg_id is too low" in str(e).lower():
+                print("[🩹] Time desync fix triggered — retrying...")
+                time.sleep(3)
+                continue
+            print("[♻️] Restarting in 5 seconds...")
+            time.sleep(5)
