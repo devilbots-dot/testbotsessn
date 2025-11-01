@@ -1,0 +1,33 @@
+{
+  "name": "Telegram Session Manager Bot",
+  "description": "A personal Telegram bot for managing and reading OTPs from session.zip files. Secure and owner-only access.",
+  "repository": "https://github.com/yourusername/Telegram-Session-Manager-Bot",
+  "stack": "heroku-22",
+  "env": {
+    "BOT_TOKEN": {
+      "description": "Your Telegram Bot Token from @BotFather",
+      "required": true
+    },
+    "API_ID": {
+      "description": "Your Telegram API ID from my.telegram.org",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Your Telegram API Hash from my.telegram.org",
+      "required": true
+    },
+    "OWNER_ID": {
+      "description": "Telegram user ID of the owner (you)",
+      "required": true
+    },
+    "MONGO_URI": {
+      "description": "MongoDB connection string to store sessions safely",
+      "required": true
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ]
+}
