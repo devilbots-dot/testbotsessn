@@ -1,0 +1,6 @@
+pyrogram==2.0.37
+telethon==1.29.2
+python-dotenv==1.0.0
+aiofiles==23.1.0
+cryptography==41.0.3
+requests==2.31.0
