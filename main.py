@@ -15,22 +15,18 @@ import subprocess
 from pathlib import Path
 from dotenv import load_dotenv
 
-# ------------------- TIME SYNC + PERFORMANCE FIX -------------------
+# ----- Fix Heroku Time Sync for Pyrogram -----
+import os, subprocess, time
+print("[⏱] Fixing Heroku clock sync...")
+
 try:
-    print("[⏱] Fixing Heroku clock sync...")
-    subprocess.call(["sudo", "ntpdate", "-s", "time.nist.gov"])
-except Exception as e:
-    print(f"[⚠️] ntpdate not available, fallback to UTC sync: {e}")
+    # Heroku doesn’t allow ntpdate usually, so fallback
     os.environ["TZ"] = "UTC"
-    try:
-        time.tzset()
-    except:
-        pass
-
-print(f"[TIME SYNC OK] Current UTC Time: {datetime.datetime.utcnow()}")
-
-# Optional startup delay (helps Heroku cold boot)
-asyncio.get_event_loop().run_until_complete(asyncio.sleep(1))
+    time.tzset()
+    print("[TIME SYNC OK] Current UTC Time:", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
+except Exception as e:
+    print("[⚠️] ntpdate not available, fallback to UTC sync:", e)
+# -------------------------------------------------
 # -------------------------------------------------------------------
 
 from pyrogram import Client, filters
@@ -273,6 +269,10 @@ async def doc_flow(c, m):
 # ---------------- Startup ----------------
 if __name__ == "__main__":
     print("Starting Session Manager Bot...")
-    import asyncio
-    asyncio.get_event_loop().run_until_complete(asyncio.sleep(3))
-    app.run()
+    try:
+        app.run()
+    except Exception as e:
+        print("[❌] App crashed:", e)
+        time.sleep(5)
+        print("[♻️] Restarting Pyrogram Client after crash...")
+        os.execv(sys.executable, ['python'] + sys.argv)
