@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-# main.py — Secure Session Manager Bot + OTP Watcher (upload-based)
-# Works with session.zip upload and monitors OTPs safely
+# main.py — Minimal Secure Session Creator + OTP-reader (no persistent sessions)
 
-import os, asyncio, tempfile, zipfile, shutil, re, time
+import os
+import time
+import asyncio
+import tempfile
+import zipfile
+import shutil
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -14,7 +19,8 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 try:
     os.environ["TZ"] = "UTC"
     time.tzset()
-except: pass
+except:
+    pass
 print("[UTC TIME]", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
 
 # ---- Load ENV ----
@@ -23,160 +29,214 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-SESSION_FOLDER = Path("sessions"); SESSION_FOLDER.mkdir(exist_ok=True)
-OTP_LOG_FOLDER = Path("otp_logs"); OTP_LOG_FOLDER.mkdir(exist_ok=True)
 if not (API_ID and API_HASH and BOT_TOKEN and OWNER_ID):
     raise SystemExit("Please set API_ID, API_HASH, BOT_TOKEN, OWNER_ID!")
 
-# ---- Globals ----
+# ---- Globals / App ----
 app = Client("otpwatch_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
-STATE, WATCHER_TASKS, WATCHER_CLIENTS = {}, [], []
-WATCHER_RUNNING = False
+STATE = {}  # simple per-owner flow state
+
+# OTP detection
 OTP_REGEX = re.compile(r"\b(\d{4,8})\b")
 OTP_HINTS = ["otp", "code", "pin", "verify", "verification", "passcode"]
 
-# ---- Utils ----
 def is_owner(uid): return uid == OWNER_ID
-async def notify(text): 
-    try: await app.send_message(OWNER_ID, text)
-    except: pass
+
+async def notify(text):
+    try:
+        await app.send_message(OWNER_ID, text)
+    except Exception:
+        pass
 
 def otp_found(text):
+    if not text: return False
     if OTP_REGEX.search(text): return True
     low = text.lower()
     return any(h in low for h in OTP_HINTS)
 
-def log_otp(name, msg):
-    with open(OTP_LOG_FOLDER / f"{name}.log", "a", encoding="utf8") as f:
-        f.write(msg + "\n")
+def extract_otps(text):
+    return OTP_REGEX.findall(text) if text else []
 
-# ---- Keyboards ----
+# ---- Keyboards (simplified) ----
 HOME_KB = InlineKeyboardMarkup([
-    [
-        InlineKeyboardButton("📞 Create Session", callback_data="create_session"),
-        InlineKeyboardButton("📤 Upload session.zip", callback_data="upload_zip")
-    ],
-    [
-        InlineKeyboardButton("🕵️ Start Watcher", callback_data="start_watcher"),
-        InlineKeyboardButton("🛑 Stop Watcher", callback_data="stop_watcher")
-    ],
+    [InlineKeyboardButton("📞 Create Session", callback_data="create_session"),
+     InlineKeyboardButton("🔎 Read OTP from session", callback_data="read_otp")],
+    [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
 ])
 
-# ---- Owner check ----
+# ---- owner-only decorator ----
 def owner_only(func):
     async def wrap(c, m):
-        if not is_owner(m.from_user.id):
-            return await m.reply_text("Access denied.")
+        # m may be Message or CallbackQuery — unify check
+        uid = None
+        if hasattr(m, "from_user") and m.from_user:
+            uid = m.from_user.id
+        elif hasattr(m, "from_user") and m.from_user:
+            uid = m.from_user.id
+        elif hasattr(m, "from_user") and m.from_user:
+            uid = m.from_user.id
+        # fallback (pyrogram callback query has .from_user)
+        if uid is None or not is_owner(uid):
+            try:
+                return await m.reply_text("Access denied.")
+            except:
+                return
         return await func(c, m)
     return wrap
 
-# ---- Create session flow ----
+# ---- Sign-in flow: send code request ----
 async def start_signin(phone, oid):
+    # Use a temporary session path (not kept)
+    safe_name = re.sub(r'[^0-9]', '_', phone)
+    tmp_dir = tempfile.mkdtemp()
+    tmp_path = Path(tmp_dir) / f"tmp_{safe_name}"
+    cli = TelegramClient(str(tmp_path), API_ID, API_HASH)
     try:
-        tmp = SESSION_FOLDER / f"tmp_{re.sub(r'[^0-9]', '_', phone)}"
-        cli = TelegramClient(str(tmp), API_ID, API_HASH)
         await cli.connect()
         sent = await cli.send_code_request(phone)
-        STATE[oid] = {"phone": phone, "tmp": str(tmp), "hash": sent.phone_code_hash, "flow": "otp"}
-        await notify("📩 OTP sent! Please reply with the code.")
-        await cli.disconnect()
+        STATE[oid] = {"phone": phone, "tmp_path": str(tmp_path), "phone_code_hash": sent.phone_code_hash, "flow": "await_code"}
+        await app.send_message(oid, "📩 Code request sent. Ab bot ko wahi code bhejo (private chat).")
     except Exception as e:
-        await notify(f"❌ Error sending code: {e}")
+        await app.send_message(oid, f"❌ Error sending code: {e}")
+        try:
+            await cli.disconnect()
+        except: pass
 
+# ---- Complete sign-in with code and send created .session to owner, then delete ----
 async def complete_signin(oid, code):
     st = STATE.get(oid, {})
-    phone, tmp, pch = st.get("phone"), st.get("tmp"), st.get("hash")
-    if not all([phone, tmp, code]): return await notify("Missing details.")
-    cli = TelegramClient(tmp, API_ID, API_HASH)
+    phone = st.get("phone")
+    tmp_path = st.get("tmp_path")
+    pch = st.get("phone_code_hash")
+    if not all([phone, tmp_path, code]):
+        await app.send_message(oid, "Missing signin state. Start again.")
+        STATE.pop(oid, None)
+        return
+
+    cli = TelegramClient(tmp_path, API_ID, API_HASH)
     try:
         await cli.connect()
         try:
             await cli.sign_in(phone=phone, code=code, phone_code_hash=pch)
         except SessionPasswordNeededError:
-            STATE[oid]["flow"] = "2fa"
-            await notify("🔐 2FA required — send password.")
-            await cli.disconnect(); return
-        f = Path(tmp + ".session")
-        dest = SESSION_FOLDER / f"{phone.replace('+','')}.session"
-        shutil.move(str(f), str(dest))
-        await notify(f"✅ Session created: `{dest.name}`")
-        await app.send_document(oid, str(dest), caption="Your session file is ready.")
+            # 2FA required
+            STATE[oid]["flow"] = "await_2fa"
+            await app.send_message(oid, "🔐 2FA is enabled on this account. Send the 2FA password now.")
+            await cli.disconnect()
+            return
+        # sign-in succeeded. telethon stores session as tmp_path + ".session"
+        session_file = Path(str(tmp_path) + ".session")
+        if not session_file.exists():
+            # fallback: telethon may use different extension; try listing tmp dir
+            # but in most cases .session exists
+            files = list(Path(tmp_path).parent.glob("*.session"))
+            session_file = files[0] if files else None
+
+        if session_file and session_file.exists():
+            # send to owner
+            await app.send_document(oid, str(session_file), caption=f"✅ Session for {phone} (temporary). Keep it safe!")
+            # delete immediately (do not store)
+            try:
+                session_file.unlink()
+            except: pass
+        else:
+            await app.send_message(oid, "⚠️ Session file not found, but login succeeded.")
+
+        await notify(f"✅ Sign-in completed for {phone}. Session file sent to owner.")
     except Exception as e:
-        await notify(f"Error signing in: {e}")
+        await app.send_message(oid, f"Error completing sign-in: {e}")
     finally:
-        try: await cli.disconnect()
-        except: pass
+        try:
+            await cli.disconnect()
+        except:
+            pass
+        # cleanup tmp dir if exists
+        try:
+            td = Path(tmp_path).parent
+            if td.exists():
+                shutil.rmtree(td, ignore_errors=True)
+        except:
+            pass
         STATE.pop(oid, None)
 
-# ---- Watcher ----
-async def watcher_runner(sf: Path):
-    name = sf.stem
-    cli = TelegramClient(str(sf), API_ID, API_HASH)
+# ---- Handler: Read OTP from an uploaded .session file (temporary use) ----
+# Flow: user presses "Read OTP from session" -> bot asks to upload .session file -> user sends document -> bot downloads, uses it to connect and scans recent messages for OTPs
+async def process_session_for_otps(owner_uid, session_file_path):
+    # session_file_path is a local filesystem path to e.g. "something.session"
+    tmp_session = Path(session_file_path)
+    name = tmp_session.stem
+    await app.send_message(owner_uid, f"🔎 Connecting with provided session `{tmp_session.name}` and scanning recent messages...")
+    cli = TelegramClient(str(tmp_session.with_suffix('')), API_ID, API_HASH)  # pass path without .session suffix is ok
     try:
         await cli.connect()
         if not await cli.is_user_authorized():
-            await notify(f"⚠️ {name} not authorized.")
-            await cli.disconnect(); return
+            await app.send_message(owner_uid, "⚠️ Provided session is not authorized / invalid.")
+            await cli.disconnect()
+            return
     except Exception as e:
-        print(f"[{name}] connect error:", e); return
-    WATCHER_CLIENTS.append(cli)
-
-    @cli.on(events.NewMessage(incoming=True))
-    async def msg(evt):
-        txt = evt.raw_text or ""
-        if otp_found(txt):
-            codes = OTP_REGEX.findall(txt)
-            msg_ = f"[{name}] OTPs: {', '.join(codes)} | msg: {txt}"
-            log_otp(name, msg_)
-            await notify(f"🔔 {msg_}")
-
-    try:
-        await cli.run_until_disconnected()
-    except Exception as e:
-        print(f"[{name}] stopped: {e}")
-    finally:
-        await cli.disconnect()
-
-async def start_watcher():
-    global WATCHER_RUNNING, WATCHER_TASKS
-    if WATCHER_RUNNING: return await notify("Watcher already running.")
-    files = [p for p in SESSION_FOLDER.iterdir() if ".session" in p.name]
-    if not files: return await notify("No sessions found.")
-    WATCHER_RUNNING = True
-    for f in files:
-        WATCHER_TASKS.append(asyncio.create_task(watcher_runner(f)))
-    await notify(f"Watcher started on {len(files)} sessions.")
-
-async def stop_watcher():
-    global WATCHER_RUNNING
-    for c in WATCHER_CLIENTS:
-        try: await c.disconnect()
+        await app.send_message(owner_uid, f"Connection error: {e}")
+        try: await cli.disconnect()
         except: pass
-    WATCHER_RUNNING = False
-    await notify("Watcher stopped.")
+        return
 
-# ---- Bot Handlers ----
+    found = []
+    try:
+        # iterate recent incoming messages globally (limit adjustable)
+        # telethon supports client.iter_messages(None, limit=N) to iterate across dialogs
+        async for msg in cli.iter_messages(None, limit=350):  # scan last 350 messages across chats
+            if not msg.message:
+                continue
+            text = msg.message
+            if otp_found(text):
+                otps = extract_otps(text)
+                chats = getattr(msg, "chat_id", None) or getattr(msg, "peer_id", None)
+                preview = text if len(text) < 200 else text[:197] + "..."
+                found.append((otps, preview, getattr(msg, "date", None)))
+        if not found:
+            await app.send_message(owner_uid, "🔕 No OTP-like messages found in the scanned recent messages.")
+        else:
+            # send results (limit size)
+            total = 0
+            for otps, preview, date in found:
+                total += 1
+                await app.send_message(owner_uid, f"🔔 Found OTP(s): {', '.join(otps)}\nMsg preview: `{preview}`")
+                if total >= 25:  # safety cap
+                    await app.send_message(owner_uid, "ℹ️ Reached reporting cap (25). Stop.")
+                    break
+    except Exception as e:
+        await app.send_message(owner_uid, f"Error scanning messages: {e}")
+    finally:
+        try:
+            await cli.disconnect()
+        except:
+            pass
+        # remove local session file
+        try:
+            tmp_session.unlink()
+        except:
+            pass
+
+# ---- Bot Command / Callback Handlers ----
 @app.on_message(filters.private & filters.command("start"))
 @owner_only
 async def start_cmd(c, m):
-    await m.reply_text("Welcome Owner!", reply_markup=HOME_KB)
+    await m.reply_text("Welcome Owner! Use the buttons below.", reply_markup=HOME_KB)
 
 @app.on_callback_query()
-async def cb(c, cb):
-    if not is_owner(cb.from_user.id): return await cb.answer("Denied", show_alert=True)
-    data = cb.data
+@owner_only
+async def cb(c, cbq):
+    data = cbq.data
     if data == "create_session":
         STATE[OWNER_ID] = {"flow": "phone"}
-        await cb.message.reply_text("Send phone in +91xxxx format")
-    elif data == "upload_zip":
-        STATE[OWNER_ID] = {"flow": "zip"}
-        await cb.message.reply_text("Send your session.zip file now.")
-    elif data == "start_watcher":
-        asyncio.create_task(start_watcher())
-        await cb.answer("Starting watcher...")
-    elif data == "stop_watcher":
-        asyncio.create_task(stop_watcher())
-        await cb.answer("Stopping watcher...")
+        await cbq.message.reply_text("Send phone in international format, e.g. +91xxxxxxxxxx")
+        await cbq.answer()
+    elif data == "read_otp":
+        STATE[OWNER_ID] = {"flow": "await_session_file"}
+        await cbq.message.reply_text("Please upload the `.session` file as a document (don't zip). Bot will temporarily use it to read recent messages for OTPs and then delete it.")
+        await cbq.answer()
+    elif data == "help":
+        await cbq.message.reply_text("Flow:\n• Create Session → send phone → receive code → send code → you'll get .session file in chat (bot won't store it)\n• Read OTP from session → upload your .session file → bot scans recent messages and returns OTP-like messages.")
+        await cbq.answer()
 
 @app.on_message(filters.private & filters.text)
 @owner_only
@@ -184,39 +244,95 @@ async def txt(c, m):
     st = STATE.get(OWNER_ID, {})
     flow = st.get("flow")
     if flow == "phone":
-        STATE[OWNER_ID] = {"phone": m.text.strip(), "flow": "otp_init"}
-        await m.reply_text("Sending OTP...")
-        asyncio.create_task(start_signin(m.text.strip(), OWNER_ID))
-    elif flow == "otp":
-        asyncio.create_task(complete_signin(OWNER_ID, m.text.strip()))
-    elif flow == "2fa":
-        await notify("2FA step can be added here manually later.")
-        STATE.pop(OWNER_ID, None)
+        phone = m.text.strip()
+        STATE[OWNER_ID] = {"flow": "await_code", "phone": phone}
+        await m.reply_text("Sending OTP request to Telegram...")
+        asyncio.create_task(start_signin(phone, OWNER_ID))
+    elif flow == "await_code":
+        code = m.text.strip()
+        asyncio.create_task(complete_signin(OWNER_ID, code))
+        await m.reply_text("Trying to complete sign-in with provided code...")
+    elif flow == "await_2fa":
+        # user provided 2FA password; try to sign in using it
+        pwd = m.text.strip()
+        st2 = STATE.get(OWNER_ID, {})
+        tmp_path = st2.get("tmp_path")
+        if not tmp_path:
+            await m.reply_text("Session temp path missing. Start over.")
+            STATE.pop(OWNER_ID, None)
+            return
+        cli = TelegramClient(tmp_path, API_ID, API_HASH)
+        try:
+            await cli.connect()
+            await cli.sign_in(password=pwd)
+            session_file = Path(str(tmp_path) + ".session")
+            await app.send_document(OWNER_ID, str(session_file), caption="✅ Session created (2FA). Keep it safe!")
+            try:
+                session_file.unlink()
+            except: pass
+            await m.reply_text("2FA sign-in complete. Session sent.")
+        except Exception as e:
+            await m.reply_text(f"2FA sign-in error: {e}")
+        finally:
+            try:
+                await cli.disconnect()
+            except: pass
+            try:
+                shutil.rmtree(Path(tmp_path).parent, ignore_errors=True)
+            except: pass
+            STATE.pop(OWNER_ID, None)
     else:
-        await m.reply_text("Use /start menu again.")
+        await m.reply_text("Use /start and buttons to begin.")
 
 @app.on_message(filters.private & filters.document)
 @owner_only
-async def upload_zip(c, m):
+async def on_document(c, m):
     st = STATE.get(OWNER_ID, {})
-    if st.get("flow") != "zip":
-        return await m.reply_text("Please choose upload option first.")
-    tmp = Path(tempfile.mkdtemp())
-    zp = tmp / m.document.file_name
-    await m.download(file_id=m.document.file_id, file_name=str(zp))
-    try:
-        with zipfile.ZipFile(zp, "r") as z:
-            z.extractall(SESSION_FOLDER)
-        await m.reply_text("✅ Uploaded and extracted. Watcher can now be started.")
-    except Exception as e:
-        await m.reply_text(f"Error: {e}")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    STATE.pop(OWNER_ID, None)
+    flow = st.get("flow")
+    # If the owner uploaded a .session file in read_otp flow
+    if flow == "await_session_file":
+        # Download the document to temp
+        tmpd = Path(tempfile.mkdtemp())
+        local = tmpd / m.document.file_name
+        await m.download(file_name=str(local))
+        # Basic validation: must end with .session (or just accept)
+        if not local.suffix == ".session":
+            # try to accept zip containing .session
+            if zipfile.is_zipfile(str(local)):
+                try:
+                    with zipfile.ZipFile(str(local), "r") as z:
+                        z.extractall(tmpd)
+                    # find first .session inside
+                    found = list(tmpd.glob("*.session"))
+                    if found:
+                        local = found[0]
+                    else:
+                        await m.reply_text("No .session file inside the zip. Send a raw .session file.")
+                        shutil.rmtree(tmpd, ignore_errors=True)
+                        STATE.pop(OWNER_ID, None)
+                        return
+                except Exception as e:
+                    await m.reply_text(f"Error extracting zip: {e}")
+                    shutil.rmtree(tmpd, ignore_errors=True)
+                    STATE.pop(OWNER_ID, None)
+                    return
+            else:
+                await m.reply_text("Please upload a `.session` file (not other file types).")
+                shutil.rmtree(tmpd, ignore_errors=True)
+                STATE.pop(OWNER_ID, None)
+                return
 
-# ---- Main ----
+        # now process session file for OTPs (async)
+        asyncio.create_task(process_session_for_otps(OWNER_ID, str(local)))
+        await m.reply_text("Session received. Scanning for OTPs — results will be posted here.")
+        # cleanup state (we won't keep file)
+        STATE.pop(OWNER_ID, None)
+    else:
+        await m.reply_text("If you want bot to read OTP from a session, first press 'Read OTP from session' button in /start.")
+
+# ---- Run ----
 if __name__ == "__main__":
-    print("🚀 Running bot...")
+    print("🚀 Running minimal devil session bot (no persistent sessions)...")
     while True:
         try:
             app.run()
