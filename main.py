@@ -1,271 +1,225 @@
 #!/usr/bin/env python3
-# main.py — Fixed for Heroku BadMsgNotification + Auto Restart + Time Sync
-# No logic changed, only stable enhancements added.
+# main.py — Secure Session Manager Bot + OTP Watcher (upload-based)
+# Works with session.zip upload and monitors OTPs safely
 
-import os
-import asyncio
-import tempfile
-import zipfile
-import shutil
-import re
-import time
-import datetime
-import subprocess
+import os, asyncio, tempfile, zipfile, shutil, re, time
 from pathlib import Path
 from dotenv import load_dotenv
+from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ----- FIX HEROKU TIME SYNC -----
-print("[⏱] Fixing Heroku clock sync...")
-
+# ---- Time sync ----
 try:
     os.environ["TZ"] = "UTC"
     time.tzset()
-    print("[TIME SYNC OK] Current UTC:", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
-except Exception as e:
-    print("[⚠️] Time sync fallback:", e)
-# ---------------------------------
+except: pass
+print("[UTC TIME]", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
 
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
-
+# ---- Load ENV ----
 load_dotenv()
-
-# ---------------- CONFIG ----------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-
-SESSION_FOLDER = Path(os.getenv("SESSION_FOLDER", "sessions"))
-SESSION_FOLDER.mkdir(parents=True, exist_ok=True)
-OTP_LOG_FOLDER = Path(os.getenv("OTP_LOG_FOLDER", "otp_logs"))
-OTP_LOG_FOLDER.mkdir(parents=True, exist_ok=True)
-
-WATCHER_CONCURRENCY = int(os.getenv("WATCHER_CONCURRENCY", "6"))
-
+SESSION_FOLDER = Path("sessions"); SESSION_FOLDER.mkdir(exist_ok=True)
+OTP_LOG_FOLDER = Path("otp_logs"); OTP_LOG_FOLDER.mkdir(exist_ok=True)
 if not (API_ID and API_HASH and BOT_TOKEN and OWNER_ID):
-    raise SystemExit("Please set API_ID, API_HASH, BOT_TOKEN and OWNER_ID in environment variables (.env)")
+    raise SystemExit("Please set API_ID, API_HASH, BOT_TOKEN, OWNER_ID!")
 
-OTP_RE = re.compile(r"\b(\d{4,8})\b")
-OTP_HINTS = ["code", "otp", "verification", "pin", "one-time", "passcode"]
-
-# Pyrogram Bot App
-app = Client("sessmgr_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
-
-STATE = {}
-WATCHER_TASKS = []
+# ---- Globals ----
+app = Client("otpwatch_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
+STATE, WATCHER_TASKS, WATCHER_CLIENTS = {}, [], []
 WATCHER_RUNNING = False
-WATCHER_CLIENTS = []
+OTP_REGEX = re.compile(r"\b(\d{4,8})\b")
+OTP_HINTS = ["otp", "code", "pin", "verify", "verification", "passcode"]
 
+# ---- Utils ----
+def is_owner(uid): return uid == OWNER_ID
+async def notify(text): 
+    try: await app.send_message(OWNER_ID, text)
+    except: pass
+
+def otp_found(text):
+    if OTP_REGEX.search(text): return True
+    low = text.lower()
+    return any(h in low for h in OTP_HINTS)
+
+def log_otp(name, msg):
+    with open(OTP_LOG_FOLDER / f"{name}.log", "a", encoding="utf8") as f:
+        f.write(msg + "\n")
+
+# ---- Keyboards ----
 HOME_KB = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🔐 Create Session", callback_data="create_session")],
-    [InlineKeyboardButton("📁 Upload session.zip (list)", callback_data="upload_list")],
-    [InlineKeyboardButton("🕵️ Start Watcher (read OTPs)", callback_data="start_watcher")],
-    [InlineKeyboardButton("⛔ Stop Watcher", callback_data="stop_watcher")],
-    [InlineKeyboardButton("ℹ️ Status", callback_data="status")],
+    [
+        InlineKeyboardButton("📞 Create Session", callback_data="create_session"),
+        InlineKeyboardButton("📤 Upload session.zip", callback_data="upload_zip")
+    ],
+    [
+        InlineKeyboardButton("🕵️ Start Watcher", callback_data="start_watcher"),
+        InlineKeyboardButton("🛑 Stop Watcher", callback_data="stop_watcher")
+    ],
 ])
 
-# ---------------- Helper ----------------
+# ---- Owner check ----
 def owner_only(func):
-    async def wrapper(c, m):
-        user_id = getattr(m.from_user, "id", None)
-        if user_id != OWNER_ID:
-            try:
-                await m.reply_text("Access denied — only owner can use this bot.")
-            except:
-                pass
-            return
+    async def wrap(c, m):
+        if not is_owner(m.from_user.id):
+            return await m.reply_text("Access denied.")
         return await func(c, m)
-    return wrapper
+    return wrap
 
-async def notify_owner_text(text):
+# ---- Create session flow ----
+async def start_signin(phone, oid):
     try:
-        await app.send_message(OWNER_ID, text)
+        tmp = SESSION_FOLDER / f"tmp_{re.sub(r'[^0-9]', '_', phone)}"
+        cli = TelegramClient(str(tmp), API_ID, API_HASH)
+        await cli.connect()
+        sent = await cli.send_code_request(phone)
+        STATE[oid] = {"phone": phone, "tmp": str(tmp), "hash": sent.phone_code_hash, "flow": "otp"}
+        await notify("📩 OTP sent! Please reply with the code.")
+        await cli.disconnect()
     except Exception as e:
-        print("Notify owner failed:", e)
+        await notify(f"❌ Error sending code: {e}")
 
-def is_otp_like(text: str) -> bool:
-    if not text:
-        return False
-    tl = text.lower()
-    if OTP_RE.search(text):
-        return True
-    for h in OTP_HINTS:
-        if h in tl:
-            return True
-    return False
+async def complete_signin(oid, code):
+    st = STATE.get(oid, {})
+    phone, tmp, pch = st.get("phone"), st.get("tmp"), st.get("hash")
+    if not all([phone, tmp, code]): return await notify("Missing details.")
+    cli = TelegramClient(tmp, API_ID, API_HASH)
+    try:
+        await cli.connect()
+        try:
+            await cli.sign_in(phone=phone, code=code, phone_code_hash=pch)
+        except SessionPasswordNeededError:
+            STATE[oid]["flow"] = "2fa"
+            await notify("🔐 2FA required — send password.")
+            await cli.disconnect(); return
+        f = Path(tmp + ".session")
+        dest = SESSION_FOLDER / f"{phone.replace('+','')}.session"
+        shutil.move(str(f), str(dest))
+        await notify(f"✅ Session created: `{dest.name}`")
+        await app.send_document(oid, str(dest), caption="Your session file is ready.")
+    except Exception as e:
+        await notify(f"Error signing in: {e}")
+    finally:
+        try: await cli.disconnect()
+        except: pass
+        STATE.pop(oid, None)
 
-def log_otp(session_name: str, line: str):
-    path = OTP_LOG_FOLDER / f"{session_name}.log"
-    with open(path, "a", encoding="utf8") as fh:
-        fh.write(line + "\n")
+# ---- Watcher ----
+async def watcher_runner(sf: Path):
+    name = sf.stem
+    cli = TelegramClient(str(sf), API_ID, API_HASH)
+    try:
+        await cli.connect()
+        if not await cli.is_user_authorized():
+            await notify(f"⚠️ {name} not authorized.")
+            await cli.disconnect(); return
+    except Exception as e:
+        print(f"[{name}] connect error:", e); return
+    WATCHER_CLIENTS.append(cli)
 
-# ---------------- Bot Commands ----------------
+    @cli.on(events.NewMessage(incoming=True))
+    async def msg(evt):
+        txt = evt.raw_text or ""
+        if otp_found(txt):
+            codes = OTP_REGEX.findall(txt)
+            msg_ = f"[{name}] OTPs: {', '.join(codes)} | msg: {txt}"
+            log_otp(name, msg_)
+            await notify(f"🔔 {msg_}")
+
+    try:
+        await cli.run_until_disconnected()
+    except Exception as e:
+        print(f"[{name}] stopped: {e}")
+    finally:
+        await cli.disconnect()
+
+async def start_watcher():
+    global WATCHER_RUNNING, WATCHER_TASKS
+    if WATCHER_RUNNING: return await notify("Watcher already running.")
+    files = [p for p in SESSION_FOLDER.iterdir() if ".session" in p.name]
+    if not files: return await notify("No sessions found.")
+    WATCHER_RUNNING = True
+    for f in files:
+        WATCHER_TASKS.append(asyncio.create_task(watcher_runner(f)))
+    await notify(f"Watcher started on {len(files)} sessions.")
+
+async def stop_watcher():
+    global WATCHER_RUNNING
+    for c in WATCHER_CLIENTS:
+        try: await c.disconnect()
+        except: pass
+    WATCHER_RUNNING = False
+    await notify("Watcher stopped.")
+
+# ---- Bot Handlers ----
 @app.on_message(filters.private & filters.command("start"))
+@owner_only
 async def start_cmd(c, m):
-    if m.from_user.id != OWNER_ID:
-        await m.reply_text("Access denied.")
-        return
-    await m.reply_text("Welcome — choose an action:", reply_markup=HOME_KB)
+    await m.reply_text("Welcome Owner!", reply_markup=HOME_KB)
 
 @app.on_callback_query()
-async def cb_handler(c, cb):
-    user_id = cb.from_user.id
-    if user_id != OWNER_ID:
-        await cb.answer("Access denied", show_alert=True)
-        return
-
+async def cb(c, cb):
+    if not is_owner(cb.from_user.id): return await cb.answer("Denied", show_alert=True)
     data = cb.data
     if data == "create_session":
-        STATE[OWNER_ID] = {"flow": "await_phone"}
-        await cb.message.reply_text("Send the phone number (international format), e.g. `+9198xxxxxxx`")
-        await cb.answer()
-        return
-
-    if data == "upload_list":
-        STATE[OWNER_ID] = {"flow": "await_zip_list"}
-        await cb.message.reply_text("Please upload a ZIP file containing .session/.sqlite/.db files.")
-        await cb.answer()
-        return
-
-    if data == "start_watcher":
-        if WATCHER_RUNNING:
-            await cb.answer("Watcher already running", show_alert=True)
-            return
-        STATE[OWNER_ID] = {"flow": "await_zip_watcher"}
-        await cb.message.reply_text("Upload your `session.zip` for OTP reading on VPS.")
-        await cb.answer()
-        return
-
-    if data == "stop_watcher":
-        if not WATCHER_RUNNING:
-            await cb.answer("Watcher not running", show_alert=True)
-            return
+        STATE[OWNER_ID] = {"flow": "phone"}
+        await cb.message.reply_text("Send phone in +91xxxx format")
+    elif data == "upload_zip":
+        STATE[OWNER_ID] = {"flow": "zip"}
+        await cb.message.reply_text("Send your session.zip file now.")
+    elif data == "start_watcher":
+        asyncio.create_task(start_watcher())
+        await cb.answer("Starting watcher...")
+    elif data == "stop_watcher":
+        asyncio.create_task(stop_watcher())
         await cb.answer("Stopping watcher...")
-        await stop_watcher()
-        await cb.message.reply_text("Watcher stopped.")
-        return
 
-    if data == "status":
-        txt = f"Watcher running: {WATCHER_RUNNING}\nStored sessions: {len(list(SESSION_FOLDER.glob('*')))}\nOTP logs dir: {OTP_LOG_FOLDER.resolve()}"
-        await cb.answer()
-        await cb.message.reply_text(txt)
-        return
-
-    await cb.answer()
-
-# ---------------- Flow Handlers ----------------
 @app.on_message(filters.private & filters.text)
-async def text_flow(c, m):
-    if m.from_user.id != OWNER_ID:
-        await m.reply_text("Access denied.")
-        return
-
-    st = STATE.get(OWNER_ID)
-    if not st:
-        await m.reply_text("Use /start to begin.")
-        return
-
+@owner_only
+async def txt(c, m):
+    st = STATE.get(OWNER_ID, {})
     flow = st.get("flow")
-    if flow == "await_phone":
-        phone = m.text.strip()
-        if not phone.startswith("+") or len(phone) < 6:
-            await m.reply_text("Send phone in international format, e.g. +9198xxxxxxx")
-            return
-        st.update({"phone": phone, "subflow": "sent_code"})
-        await m.reply_text("Requesting code... (may take a few seconds)")
-        asyncio.create_task(initiate_send_code(phone, OWNER_ID))
-        return
-
-    if flow == "await_otp_for_signin":
-        otp = m.text.strip()
-        st.update({"otp": otp})
-        await m.reply_text("Received OTP — attempting to complete sign-in...")
-        await complete_signin_flow(OWNER_ID)
-        return
-
-    if flow == "await_2fa":
-        pwd = m.text.strip()
-        st.update({"2fa": pwd})
-        await m.reply_text("Received 2FA password — attempting to complete sign-in...")
-        await complete_signin_flow(OWNER_ID)
-        return
-
-    await m.reply_text("Unhandled flow state. Use /start again.")
+    if flow == "phone":
+        STATE[OWNER_ID] = {"phone": m.text.strip(), "flow": "otp_init"}
+        await m.reply_text("Sending OTP...")
+        asyncio.create_task(start_signin(m.text.strip(), OWNER_ID))
+    elif flow == "otp":
+        asyncio.create_task(complete_signin(OWNER_ID, m.text.strip()))
+    elif flow == "2fa":
+        await notify("2FA step can be added here manually later.")
+        STATE.pop(OWNER_ID, None)
+    else:
+        await m.reply_text("Use /start menu again.")
 
 @app.on_message(filters.private & filters.document)
-async def doc_flow(c, m):
-    if m.from_user.id != OWNER_ID:
-        await m.reply_text("Access denied.")
-        return
+@owner_only
+async def upload_zip(c, m):
+    st = STATE.get(OWNER_ID, {})
+    if st.get("flow") != "zip":
+        return await m.reply_text("Please choose upload option first.")
+    tmp = Path(tempfile.mkdtemp())
+    zp = tmp / m.document.file_name
+    await m.download(file_id=m.document.file_id, file_name=str(zp))
+    try:
+        with zipfile.ZipFile(zp, "r") as z:
+            z.extractall(SESSION_FOLDER)
+        await m.reply_text("✅ Uploaded and extracted. Watcher can now be started.")
+    except Exception as e:
+        await m.reply_text(f"Error: {e}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    STATE.pop(OWNER_ID, None)
 
-    st = STATE.get(OWNER_ID)
-    if not st:
-        await m.reply_text("Use /start to begin.")
-        return
-
-    file_name = m.document.file_name.lower()
-    tmpdir = Path(tempfile.mkdtemp())
-    zip_path = tmpdir / (m.document.file_name or "upload.zip")
-    await m.download(file_id=m.document.file_id, file_name=str(zip_path))
-
-    if st.get("flow") == "await_zip_list":
-        found = []
-        try:
-            with zipfile.ZipFile(str(zip_path), "r") as z:
-                for info in z.infolist():
-                    if info.filename.lower().endswith((".session", ".sqlite", ".db")):
-                        found.append(info.filename)
-        except Exception as e:
-            await m.reply_text(f"Error reading ZIP: {e}")
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            return
-
-        msg = "Found session files:\n" + ("\n".join(found) if found else "None found.")
-        await m.reply_text(msg)
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        STATE.pop(OWNER_ID, None)
-        return
-
-    if st.get("flow") == "await_zip_watcher":
-        try:
-            extract_to = tmpdir / "extracted"
-            extract_to.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(str(zip_path), "r") as z:
-                z.extractall(extract_to)
-
-            moved = []
-            for p in extract_to.rglob("*"):
-                if p.is_file() and (p.suffix.lower() in (".session", ".sqlite", ".db") or ".session" in p.name.lower()):
-                    dest = SESSION_FOLDER / p.name
-                    shutil.move(str(p), str(dest))
-                    moved.append(dest.name)
-
-            await m.reply_text(f"Saved {len(moved)} session files to `{SESSION_FOLDER}`. Starting watcher now...")
-            STATE.pop(OWNER_ID, None)
-            await start_watcher()
-        except Exception as e:
-            await m.reply_text(f"Error preparing watcher: {e}")
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        return
-
-    await m.reply_text("No action for this document. Use /start.")
-
-# ---------------- SAFE MAIN LOOP ----------------
+# ---- Main ----
 if __name__ == "__main__":
-    print("Starting Session Manager Bot...")
-
+    print("🚀 Running bot...")
     while True:
         try:
             app.run()
         except Exception as e:
-            print(f"[❌] Bot crashed: {e}")
-            if "msg_id is too low" in str(e).lower():
-                print("[🩹] Time desync fix triggered — retrying...")
-                time.sleep(3)
-                continue
-            print("[♻️] Restarting in 5 seconds...")
+            print("[BOT CRASH]", e)
             time.sleep(5)
