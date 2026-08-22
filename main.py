@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# main.py — Fixed: Telethon-format Session Creator + OTP Reader (Stable)
+# Telethon-format Session Creator + OTP Reader (Stable)
 # Author: Ankit Edition
 
 import os
